@@ -4,6 +4,7 @@
 // Displays a friendly cyberpunk-themed error screen for OAuth failures,
 // session expiry, and access-denied scenarios.
 
+import { Suspense } from "react";
 import { useSearchParams } from "next/navigation";
 import Link from "next/link";
 
@@ -30,7 +31,7 @@ const ERROR_DETAIL: Record<string, { title: string; body: string; icon: string }
   },
 };
 
-export default function AuthErrorPage() {
+function AuthErrorContent() {
   const searchParams = useSearchParams();
   const errorCode    = searchParams.get("error") ?? "Default";
   const detail       = ERROR_DETAIL[errorCode] ?? ERROR_DETAIL.Default;
@@ -115,5 +116,13 @@ export default function AuthErrorPage() {
         </p>
       </div>
     </div>
+  );
+}
+
+export default function AuthErrorPage() {
+  return (
+    <Suspense fallback={<div className="container" style={{ textAlign: "center", paddingTop: 80 }}>Loading...</div>}>
+      <AuthErrorContent />
+    </Suspense>
   );
 }

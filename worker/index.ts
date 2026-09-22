@@ -5,7 +5,7 @@
 // Placed in /worker/index.js — the customWorkerSrc setting points here.
 // =============================================================================
 
-declare const self: ServiceWorkerGlobalScope;
+const sw = self as unknown as ServiceWorkerGlobalScope;
 
 const CACHE_VERSION = "cq-v1";
 const STATIC_CACHE = `${CACHE_VERSION}-static`;
@@ -21,17 +21,17 @@ const PRECACHE_URLS = [
 // ---------------------------------------------------------------------------
 // Install — pre-cache shell
 // ---------------------------------------------------------------------------
-self.addEventListener("install", (event: ExtendableEvent) => {
+sw.addEventListener("install", (event: ExtendableEvent) => {
   event.waitUntil(
     caches.open(STATIC_CACHE).then((cache) => cache.addAll(PRECACHE_URLS))
   );
-  self.skipWaiting();
+  sw.skipWaiting();
 });
 
 // ---------------------------------------------------------------------------
 // Activate — clean old caches
 // ---------------------------------------------------------------------------
-self.addEventListener("activate", (event: ExtendableEvent) => {
+sw.addEventListener("activate", (event: ExtendableEvent) => {
   event.waitUntil(
     caches.keys().then((keys) =>
       Promise.all(
@@ -41,13 +41,13 @@ self.addEventListener("activate", (event: ExtendableEvent) => {
       )
     )
   );
-  self.clients.claim();
+  sw.clients.claim();
 });
 
 // ---------------------------------------------------------------------------
 // Fetch — strategy router
 // ---------------------------------------------------------------------------
-self.addEventListener("fetch", (event: FetchEvent) => {
+sw.addEventListener("fetch", (event: FetchEvent) => {
   const { request } = event;
   const url = new URL(request.url);
 
@@ -97,10 +97,10 @@ async function cacheFirst(req: Request, cacheName: string): Promise<Response> {
 // ---------------------------------------------------------------------------
 // Push notifications (future use)
 // ---------------------------------------------------------------------------
-self.addEventListener("push", (event: PushEvent) => {
+sw.addEventListener("push", (event: PushEvent) => {
   const data = event.data?.json() ?? { title: "CodeQuest", body: "New quest available!" };
   event.waitUntil(
-    self.registration.showNotification(data.title, {
+    sw.registration.showNotification(data.title, {
       body: data.body,
       icon: "/icons/icon-192x192.png",
       badge: "/icons/icon-96x96.png",
@@ -109,7 +109,7 @@ self.addEventListener("push", (event: PushEvent) => {
   );
 });
 
-self.addEventListener("notificationclick", (event: NotificationEvent) => {
+sw.addEventListener("notificationclick", (event: NotificationEvent) => {
   event.notification.close();
-  event.waitUntil(self.clients.openWindow("/"));
+  event.waitUntil(sw.clients.openWindow("/"));
 });

@@ -1,35 +1,53 @@
 'use client';
 // components/GameModalAdapter.tsx
 // Wraps each game modal with:
-//   1. Auth gate  — redirects unauthenticated users to /auth/signin
+//   1. Local demo auth state (always allowed)
 //   2. Heart gate — blocks entry when hearts === 0
-//   3. Quest submit hook — calls /api/quests/submit on completion
-//   4. Mistake hook — calls /api/hearts/lose and updates Zustand store
+//   3. Quest submit hook — local XP + badge + skill calculation
+//   4. Mistake hook — deducts heart in local Zustand store
+//   5. Phase 7 Quest Completion Victory Panel with real XP, level progress, hearts, badges, and Next Quest CTA.
 //
 // Usage:
-//   <GameModalAdapter questId="syntax-dungeon" minTimeSecs={10}>
+//   <GameModalAdapter questId="syntax-dungeon" minTimeSecs={10} onNextQuest={...} onClose={...}>
 //     <SyntaxDungeonGame />
 //   </GameModalAdapter>
 //
 // Children receive the context via useGameModal():
-//   const { onComplete, onMistake, isBlocked } = useGameModal();
+//   const { onComplete, onMistake, isBlocked, isCompleted, resetCompletion } = useGameModal();
 
 import React, { createContext, useContext, useCallback, useRef, useState } from "react";
-import { useSession, signIn } from "next-auth/react";
-import { useGameStore } from "@/store/gameStore";
+import { useGameStore, calcLevel, calcXpToNext, calcXpInLevel, BadgeState } from "@/store/gameStore";
+import { QUEST_CONFIG } from "@/lib/questConfig";
+
+export interface QuestCompletionData {
+  questId: string;
+  xpEarned: number;
+  newTotalXp: number;
+  newLevel: number;
+  leveledUp: boolean;
+  xpInLevel: number;
+  xpToNext: number;
+  hearts: number;
+  newBadges: BadgeState[];
+  nextQuestId: string | null;
+}
 
 // ---------------------------------------------------------------------------
 // Context
 // ---------------------------------------------------------------------------
 interface GameModalContextValue {
   /** Call this when the player finishes the quest successfully */
-  onComplete:  (opts?: { isOptimal?: boolean }) => Promise<void>;
+  onComplete: (opts?: { isOptimal?: boolean }) => Promise<void>;
   /** Call this when the player makes a mistake (loses a heart) */
-  onMistake:   () => Promise<void>;
+  onMistake: () => Promise<void>;
   /** True when hearts === 0 — render a "No hearts" overlay in the game */
-  isBlocked:   boolean;
+  isBlocked: boolean;
   /** True while the submit request is in-flight */
   isSubmitting: boolean;
+  /** True if quest completion overlay is active */
+  isCompleted: boolean;
+  /** Reset completion state for replaying */
+  resetCompletion: () => void;
 }
 
 const GameModalContext = createContext<GameModalContextValue | null>(null);
@@ -41,9 +59,9 @@ export function useGameModal(): GameModalContextValue {
 }
 
 // ---------------------------------------------------------------------------
-// Static badge catalogue (matches DB seeds — used for toast enrichment)
+// Static badge catalogue
 // ---------------------------------------------------------------------------
-const ALL_BADGES = [
+export const ALL_BADGES: BadgeState[] = [
   { id: "first-login",     icon: "🌟", name: "FIRST LOGIN",     description: "Opened CodeQuest" },
   { id: "bug-squasher",    icon: "🐛", name: "BUG SQUASHER",    description: "Completed a syntax puzzle" },
   { id: "time-traveler",   icon: "⏪", name: "TIME TRAVELER",   description: "Stepped backward in execution" },
@@ -58,111 +76,302 @@ const ALL_BADGES = [
   { id: "completionist",   icon: "🏆", name: "COMPLETIONIST",   description: "Cleared all six games" },
 ];
 
+const QUEST_BADGES: Record<string, string[]> = {
+  "syntax-dungeon": ["bug-squasher"],
+  "exec-arena":     ["debugger"],
+  "sort-arena":     ["sort-master"],
+  "hanoi":          ["tower-conqueror"],
+  "bst":            ["tree-whisperer"],
+  "stack-boss":     ["stack-overflow", "queue-master"],
+};
+
+const QUEST_UNLOCK_SKILLS: Record<string, string[]> = {
+  "syntax-dungeon": ["functions", "execution"],
+  "exec-arena":     ["recursion", "sorting"],
+  "sort-arena":     ["sorting", "hanoi"],
+  "hanoi":          ["hanoi", "trees"],
+  "bst":            ["trees", "stacks"],
+  "stack-boss":     ["stacks"],
+};
+
+const QUEST_SEQUENCE = [
+  "syntax-dungeon",
+  "exec-arena",
+  "sort-arena",
+  "hanoi",
+  "bst",
+  "stack-boss",
+];
+
 // ---------------------------------------------------------------------------
 // Component
 // ---------------------------------------------------------------------------
 interface GameModalAdapterProps {
-  questId:     string;
-  minTimeSecs: number;        // anti-cheat minimum — component enforces locally too
-  children:    React.ReactNode;
+  questId: string;
+  minTimeSecs: number;
+  children: React.ReactNode;
+  onNextQuest?: (nextQuestId: string) => void;
+  onClose?: () => void;
 }
 
-export function GameModalAdapter({ questId, minTimeSecs, children }: GameModalAdapterProps) {
-  const { data: session, status } = useSession();
-  const loseHeart       = useGameStore((s) => s.loseHeart);
-  const hearts          = useGameStore((s) => s.hearts);
+export function GameModalAdapter({
+  questId,
+  minTimeSecs,
+  children,
+  onNextQuest,
+  onClose,
+}: GameModalAdapterProps) {
+  const loseHeart        = useGameStore((s) => s.loseHeart);
+  const hearts           = useGameStore((s) => s.hearts);
   const applyQuestResult = useGameStore((s) => s.applyQuestResult);
 
-  const startTimeRef    = useRef<number>(Date.now());
+  const startTimeRef     = useRef<number>(Date.now());
   const [isSubmitting, setIsSubmitting] = useState(false);
+  const [completionData, setCompletionData] = useState<QuestCompletionData | null>(null);
 
-  // Auth gate: redirect if unauthenticated
-  const assertAuth = useCallback(() => {
-    if (status === "unauthenticated") {
-      signIn(undefined, { callbackUrl: window.location.href });
-      return false;
-    }
-    return status === "authenticated";
-  }, [status]);
+  const resetCompletion = useCallback(() => {
+    setCompletionData(null);
+    startTimeRef.current = Date.now();
+  }, []);
 
   // -------------------------------------------------------------------
-  // onComplete
+  // onComplete — local demo mode (no DB / server required)
   // -------------------------------------------------------------------
   const onComplete = useCallback(async (opts: { isOptimal?: boolean } = {}) => {
-    if (!assertAuth()) return;
-
     const elapsed = Math.floor((Date.now() - startTimeRef.current) / 1000);
     if (elapsed < minTimeSecs) {
-      // Client-side anti-cheat guard (server also validates)
-      console.warn(`Quest completed too fast (${elapsed}s < ${minTimeSecs}s)`);
+      console.warn(`Quest completed fast (${elapsed}s < ${minTimeSecs}s)`);
     }
 
     setIsSubmitting(true);
     try {
-      const res = await fetch("/api/quests/submit", {
-        method:  "POST",
-        headers: { "Content-Type": "application/json" },
-        body:    JSON.stringify({
-          questId,
-          timeSpentSeconds: Math.max(elapsed, minTimeSecs),
-          isOptimal: opts.isOptimal ?? false,
-        }),
+      // Find quest metadata
+      const quest = QUEST_CONFIG.find((q) => q.id === questId);
+      const baseXp = quest?.baseXp ?? 30;
+
+      const store = useGameStore.getState();
+      const streak = store.streakCount || 1;
+      const streakMultiplier = Math.min(1 + streak * 0.1, 2.0);
+      const xpEarned = Math.round(baseXp * streakMultiplier);
+
+      const newTotalXp = store.totalXp + xpEarned;
+      const newLevel   = calcLevel(newTotalXp);
+      const leveledUp  = newLevel > store.level;
+      const xpToNext   = calcXpToNext(newLevel);
+      const xpInLevel  = calcXpInLevel(newTotalXp, newLevel);
+
+      // Evaluate new badges
+      const existingBadgeIds = new Set(store.badges.map((b) => b.id));
+      const newBadgeIds: string[] = [];
+
+      for (const bId of QUEST_BADGES[questId] ?? []) {
+        if (!existingBadgeIds.has(bId)) newBadgeIds.push(bId);
+      }
+
+      if (questId === "hanoi" && opts.isOptimal && !existingBadgeIds.has("perfect-hanoi")) {
+        newBadgeIds.push("perfect-hanoi");
+      }
+
+      // Check on-a-roll: 3 quest completions
+      const clearedCount = Object.keys(store.cleared).length;
+      if (clearedCount + 1 >= 3 && !existingBadgeIds.has("on-a-roll")) {
+        newBadgeIds.push("on-a-roll");
+      }
+
+      // Check completionist: all 6 quests cleared
+      const allQuestIds = QUEST_CONFIG.map((q) => q.id);
+      const willHaveAll = allQuestIds.every((id) => id === questId || store.cleared[id]);
+      if (willHaveAll && !existingBadgeIds.has("completionist")) {
+        newBadgeIds.push("completionist");
+      }
+
+      // Skills to unlock
+      const updatedSkills = QUEST_UNLOCK_SKILLS[questId] ?? [];
+
+      // Determine next quest in sequence
+      const currIdx = QUEST_SEQUENCE.indexOf(questId);
+      const nextQId = currIdx >= 0 && currIdx < QUEST_SEQUENCE.length - 1
+        ? QUEST_SEQUENCE[currIdx + 1]
+        : null;
+
+      const newBadgesList = newBadgeIds
+        .map((bId) => ALL_BADGES.find((b) => b.id === bId))
+        .filter(Boolean) as BadgeState[];
+
+      applyQuestResult({
+        questId,
+        xpEarned,
+        newTotalXp,
+        newLevel,
+        leveledUp,
+        xpToNext,
+        newBadges: newBadgeIds,
+        updatedSkills,
+      }, ALL_BADGES);
+
+      // Save for Victory Panel display
+      setCompletionData({
+        questId,
+        xpEarned,
+        newTotalXp,
+        newLevel,
+        leveledUp,
+        xpInLevel,
+        xpToNext,
+        hearts: store.hearts,
+        newBadges: newBadgesList,
+        nextQuestId: nextQId,
       });
 
-      if (!res.ok) {
-        const err = await res.json().catch(() => ({}));
-        console.error("Quest submit error:", err);
-        return;
-      }
-
-      const data = await res.json();
-      applyQuestResult(data, ALL_BADGES);
     } finally {
       setIsSubmitting(false);
-      startTimeRef.current = Date.now(); // reset timer for replays
     }
-  }, [assertAuth, applyQuestResult, minTimeSecs, questId]);
+  }, [applyQuestResult, minTimeSecs, questId]);
 
   // -------------------------------------------------------------------
-  // onMistake
+  // onMistake — local heart deduction
   // -------------------------------------------------------------------
   const onMistake = useCallback(async () => {
-    if (!assertAuth()) return;
-
-    // Optimistic update
     loseHeart();
+  }, [loseHeart]);
 
-    try {
-      const res = await fetch("/api/hearts/lose", { method: "POST" });
-      if (res.ok) {
-        const { hearts: serverHearts } = await res.json();
-        // Re-sync if server disagrees (e.g. regen happened between calls)
-        useGameStore.getState().setHearts(serverHearts);
-      }
-    } catch {
-      // Keep the optimistic deduction; will sync on next profile load
-    }
-  }, [assertAuth, loseHeart]);
-
-  // -------------------------------------------------------------------
-  // Render
-  // -------------------------------------------------------------------
   const isBlocked = hearts <= 0;
+  const isCompleted = completionData !== null;
 
   return (
-    <GameModalContext.Provider value={{ onComplete, onMistake, isBlocked, isSubmitting }}>
+    <GameModalContext.Provider
+      value={{
+        onComplete,
+        onMistake,
+        isBlocked,
+        isSubmitting,
+        isCompleted,
+        resetCompletion,
+      }}
+    >
+      {/* ── HEARTS BLOCKED OVERLAY ── */}
       {isBlocked && (
-        <div className="hearts-blocked-overlay">
+        <div className="hearts-blocked-overlay" role="alert">
           <div className="hearts-blocked-inner">
             <span className="hearts-blocked-icon">💔</span>
             <h2 className="hearts-blocked-title">OUT OF HEARTS</h2>
             <p className="hearts-blocked-body">
-              Hearts regenerate at +1 every 30 minutes.<br />
-              Come back later or keep reading!
+              Your neural energy has depleted.<br />
+              Hearts regenerate passively (+1 every 30 mins) or reset demo progress via your avatar in the HUD!
             </p>
+            <div style={{ marginTop: 20 }}>
+              <button
+                className="btn btn--secondary"
+                onClick={() => {
+                  useGameStore.getState().setHearts(5);
+                }}
+              >
+                ⚡ RECHARGE HEARTS (DEMO)
+              </button>
+            </div>
           </div>
         </div>
       )}
+
+      {/* ── PHASE 7: QUEST COMPLETION VICTORY PANEL ── */}
+      {completionData && (
+        <div className="quest-completion-overlay" role="dialog" aria-label="Quest completed">
+          <div className="quest-completion-card">
+            {/* Victory Badge */}
+            <div className="quest-completion-icon-wrap">
+              <span className="quest-completion-icon">🏆</span>
+            </div>
+
+            <span className="quest-completion-tag">MISSION ACCOMPLISHED</span>
+            <h2 className="quest-completion-title">QUEST COMPLETE</h2>
+            <p className="quest-completion-subtitle">
+              Challenge validated and registered to the Neural Grid!
+            </p>
+
+            {/* XP Reward Banner */}
+            <div className="quest-completion-reward">
+              <span className="quest-completion-xp-label">EXPERIENCE ACCRUED</span>
+              <span className="quest-completion-xp-val">+{completionData.xpEarned} XP</span>
+            </div>
+
+            {/* Progress Telemetry */}
+            <div className="quest-completion-progress-box">
+              <div className="quest-completion-progress-header">
+                <span>
+                  LEVEL {completionData.newLevel}
+                  {completionData.leveledUp && <b className="quest-completion-levelup-tag"> ★ LEVEL UP!</b>}
+                </span>
+                <span>{completionData.xpInLevel} / {completionData.xpToNext} XP</span>
+              </div>
+              <div className="quest-completion-bar-track">
+                <div
+                  className="quest-completion-bar-fill"
+                  style={{
+                    width: `${Math.min(100, Math.round((completionData.xpInLevel / completionData.xpToNext) * 100))}%`,
+                  }}
+                />
+              </div>
+
+              <div className="quest-completion-vitals">
+                <span className="quest-completion-hearts-label">HEARTS REMAINING:</span>
+                <span className="quest-completion-hearts">
+                  {"❤".repeat(completionData.hearts) + "🖤".repeat(Math.max(0, 5 - completionData.hearts))}
+                </span>
+              </div>
+            </div>
+
+            {/* Unlocked Badges */}
+            {completionData.newBadges.length > 0 && (
+              <div className="quest-completion-badges-box">
+                <span className="quest-completion-badges-title">NEW TROPHIES UNLOCKED:</span>
+                <div className="quest-completion-badges-list">
+                  {completionData.newBadges.map((b) => (
+                    <div key={b.id} className="quest-completion-badge-pill">
+                      <span>{b.icon}</span>
+                      <span>{b.name}</span>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}
+
+            {/* Navigation Actions */}
+            <div className="quest-completion-actions">
+              {completionData.nextQuestId && onNextQuest ? (
+                <button
+                  className="btn btn--primary quest-completion-btn-next"
+                  onClick={() => {
+                    const nextId = completionData.nextQuestId!;
+                    resetCompletion();
+                    onNextQuest(nextId);
+                  }}
+                >
+                  NEXT QUEST →
+                </button>
+              ) : null}
+
+              <button
+                className="btn btn--secondary"
+                onClick={() => {
+                  resetCompletion();
+                  onClose?.();
+                }}
+              >
+                🗺 QUEST MAP
+              </button>
+
+              <button
+                className="btn btn--ghost btn-sm"
+                onClick={resetCompletion}
+              >
+                ↺ Replay Challenge
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Actual Game Content */}
       {children}
     </GameModalContext.Provider>
   );

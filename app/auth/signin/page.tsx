@@ -4,11 +4,11 @@
 // Registered in lib/auth.ts → pages.signIn so NextAuth redirects here
 // instead of the default /api/auth/signin.
 
-import { useState, FormEvent } from "react";
+import { Suspense, useState, FormEvent } from "react";
 import { signIn, getProviders } from "next-auth/react";
 import { useRouter, useSearchParams } from "next/navigation";
 
-export default function SignInPage() {
+function SignInForm() {
   const router       = useRouter();
   const searchParams = useSearchParams();
   const callbackUrl  = searchParams.get("callbackUrl") ?? "/";
@@ -193,5 +193,13 @@ export default function SignInPage() {
         </form>
       </div>
     </div>
+  );
+}
+
+export default function SignInPage() {
+  return (
+    <Suspense fallback={<div className="container" style={{ textAlign: "center", paddingTop: 80 }}>Loading...</div>}>
+      <SignInForm />
+    </Suspense>
   );
 }

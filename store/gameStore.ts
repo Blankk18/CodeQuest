@@ -1,7 +1,6 @@
 // store/gameStore.ts
-// Zustand store — single source of truth for all HUD state.
-// The `persist` middleware backs it to localStorage so the UI survives a refresh
-// while the user is offline; a sync call overwrites it with server truth on mount.
+// Zustand store — single source of truth for all HUD and game state.
+// Backed by localStorage via `persist` middleware for offline/demo play.
 
 import { create } from "zustand";
 import { persist, createJSONStorage } from "zustand/middleware";
@@ -37,12 +36,16 @@ export interface GameState {
   hearts:      number;
   streakCount: number;
 
+  // Timestamps for local simulation
+  lastHeartLossAt: number | null;
+  lastActiveDate:  string | null;
+
   // Progress
   badges:     BadgeState[];
   skillNodes: SkillNodeState[];
   cleared:    QuestCleared;
 
-  // Auth
+  // Auth / Player
   userId:     string | null;
   userName:   string | null;
   userImage:  string | null;
@@ -52,7 +55,10 @@ export interface GameState {
 }
 
 export interface GameActions {
-  // Called after /api/profile returns
+  // Local demo initialization on app load (streak check + passive heart regen)
+  initializeDemo: () => void;
+
+  // Called after /api/profile returns (if backend is connected)
   syncFromServer: (profile: {
     user: { id: string; name: string | null; image: string | null; totalXp: number; level: number; hearts: number; streakCount: number };
     earnedBadges: BadgeState[];
@@ -60,8 +66,9 @@ export interface GameActions {
     clearedQuestIds: string[];
   }) => void;
 
-  // Called after /api/quests/submit returns
+  // Called after quest completion (local or server)
   applyQuestResult: (result: {
+    questId?: string;
     xpEarned: number;
     newTotalXp: number;
     newLevel: number;
@@ -71,7 +78,7 @@ export interface GameActions {
     updatedSkills: string[];
   }, allBadges: BadgeState[]) => void;
 
-  // Local heart updates (optimistic; server is source of truth)
+  // Local heart updates
   loseHeart:   () => void;
   setHearts:   (n: number) => void;
 
@@ -82,22 +89,44 @@ export interface GameActions {
   pushToast:   (t: GameState["toasts"][number]) => void;
   dismissToast:(id: string) => void;
 
-  // Reset (sign-out)
+  // Reset (sign-out / reset demo)
   reset: () => void;
 }
 
 // ---------------------------------------------------------------------------
-// Level helpers (must match server formula in /api/quests/submit)
+// Canonical Initial Seed Data
 // ---------------------------------------------------------------------------
-function calcLevel(totalXp: number): number {
+export const INITIAL_SKILL_NODES: SkillNodeState[] = [
+  { id: "vars",      icon: "📝", name: "Variables",       questId: "syntax-dungeon", status: "unlocked" },
+  { id: "loops",     icon: "🔄", name: "Loops",           questId: "syntax-dungeon", status: "unlocked" },
+  { id: "functions", icon: "λ",  name: "Functions",       questId: "syntax-dungeon", status: "active"   },
+  { id: "execution", icon: "⚡", name: "Execution",       questId: "exec-arena",     status: "active"   },
+  { id: "recursion", icon: "∞",  name: "Recursion",       questId: "exec-arena",     status: "locked"   },
+  { id: "sorting",   icon: "🫧", name: "Sorting",         questId: "sort-arena",     status: "locked"   },
+  { id: "hanoi",     icon: "🏰", name: "Recursion+",      questId: "hanoi",          status: "locked"   },
+  { id: "trees",     icon: "🌳", name: "Trees",           questId: "bst",            status: "locked"   },
+  { id: "stacks",    icon: "📚", name: "Stacks & Queues", questId: "stack-boss",     status: "locked"   },
+];
+
+export const FIRST_LOGIN_BADGE: BadgeState = {
+  id: "first-login",
+  icon: "🌟",
+  name: "FIRST LOGIN",
+  description: "Opened CodeQuest",
+};
+
+// ---------------------------------------------------------------------------
+// Level helpers (matches server formula in /api/quests/submit)
+// ---------------------------------------------------------------------------
+export function calcLevel(totalXp: number): number {
   return Math.floor(Math.pow(totalXp / 100, 1 / 1.5)) + 1;
 }
 
-function calcXpToNext(level: number): number {
+export function calcXpToNext(level: number): number {
   return Math.round(100 * Math.pow(level, 1.5));
 }
 
-function calcXpInLevel(totalXp: number, level: number): number {
+export function calcXpInLevel(totalXp: number, level: number): number {
   const prevLevelXp = level > 1 ? Math.round(100 * Math.pow(level - 1, 1.5)) : 0;
   return totalXp - prevLevelXp;
 }
@@ -106,19 +135,21 @@ function calcXpInLevel(totalXp: number, level: number): number {
 // Initial state
 // ---------------------------------------------------------------------------
 const INITIAL: GameState = {
-  xp:          0,
-  totalXp:     0,
-  level:       1,
-  xpToNext:    100,
-  hearts:      5,
-  streakCount: 0,
-  badges:      [],
-  skillNodes:  [],
-  cleared:     {},
-  userId:      null,
-  userName:    null,
-  userImage:   null,
-  toasts:      [],
+  xp:              0,
+  totalXp:         0,
+  level:           1,
+  xpToNext:        100,
+  hearts:          5,
+  streakCount:     1,
+  lastHeartLossAt: null,
+  lastActiveDate:  null,
+  badges:          [FIRST_LOGIN_BADGE],
+  skillNodes:      INITIAL_SKILL_NODES,
+  cleared:         {},
+  userId:          "demo-user",
+  userName:        "Cyber Quester",
+  userImage:       null,
+  toasts:          [],
 };
 
 // ---------------------------------------------------------------------------
@@ -129,10 +160,60 @@ export const useGameStore = create<GameState & GameActions>()(
     (set, get) => ({
       ...INITIAL,
 
+      initializeDemo() {
+        const today = new Date().toISOString().slice(0, 10);
+        const lastActive = get().lastActiveDate;
+        let streak = get().streakCount || 1;
+
+        if (!lastActive) {
+          streak = 1;
+        } else if (lastActive === today) {
+          // Already logged in today
+        } else {
+          const yesterday = new Date(Date.now() - 86400000).toISOString().slice(0, 10);
+          if (lastActive === yesterday) {
+            streak += 1;
+          } else {
+            streak = 1;
+          }
+        }
+
+        // Passive heart regeneration: +1 per 30 minutes
+        let hearts = get().hearts ?? 5;
+        let lastLoss = get().lastHeartLossAt;
+        if (hearts < 5 && lastLoss) {
+          const minutesSince = (Date.now() - lastLoss) / 60000;
+          const regen = Math.floor(minutesSince / 30);
+          if (regen > 0) {
+            hearts = Math.min(5, hearts + regen);
+            lastLoss = hearts === 5 ? null : lastLoss + regen * 30 * 60 * 1000;
+          }
+        }
+
+        // Ensure skill nodes and badges are populated
+        const currentNodes = get().skillNodes;
+        const skillNodes = currentNodes && currentNodes.length > 0 ? currentNodes : INITIAL_SKILL_NODES;
+
+        const currentBadges = get().badges || [];
+        const hasFirstLogin = currentBadges.some((b) => b.id === "first-login");
+        const badges = hasFirstLogin ? currentBadges : [FIRST_LOGIN_BADGE, ...currentBadges];
+
+        set({
+          userId:          get().userId || "demo-user",
+          userName:        get().userName || "Cyber Quester",
+          streakCount:     streak,
+          lastActiveDate:  today,
+          hearts,
+          lastHeartLossAt: lastLoss,
+          skillNodes,
+          badges,
+        });
+      },
+
       syncFromServer({ user, earnedBadges, skillNodes, clearedQuestIds }) {
-        const level   = calcLevel(user.totalXp);
+        const level    = calcLevel(user.totalXp);
         const xpToNext = calcXpToNext(level);
-        const xp      = calcXpInLevel(user.totalXp, level);
+        const xp       = calcXpInLevel(user.totalXp, level);
         const cleared: QuestCleared = {};
         for (const id of clearedQuestIds) cleared[id] = true;
 
@@ -153,7 +234,7 @@ export const useGameStore = create<GameState & GameActions>()(
       },
 
       applyQuestResult(result, allBadges) {
-        const { newTotalXp, newLevel, leveledUp, xpToNext: xtn, newBadges, updatedSkills } = result;
+        const { questId, newTotalXp, newLevel, leveledUp, xpToNext: xtn, newBadges, updatedSkills } = result;
         const xp = calcXpInLevel(newTotalXp, newLevel);
 
         const newToasts = [...get().toasts];
@@ -169,8 +250,9 @@ export const useGameStore = create<GameState & GameActions>()(
         // Badge toasts
         for (const badgeId of newBadges) {
           const badge = allBadges.find((b) => b.id === badgeId);
-          if (badge)
+          if (badge) {
             newToasts.push({ id: `badge-${badgeId}`, type: "badge", payload: badge });
+          }
         }
 
         // Merge new badges into earned set
@@ -195,17 +277,26 @@ export const useGameStore = create<GameState & GameActions>()(
           xp,
           badges:     mergedBadges,
           skillNodes: updatedNodes,
-          cleared:    { ...s.cleared, [result as any]: true },
+          cleared:    questId ? { ...s.cleared, [questId]: true } : s.cleared,
           toasts:     newToasts,
         }));
       },
 
       loseHeart() {
-        set((s) => ({ hearts: Math.max(0, s.hearts - 1) }));
+        set((s) => {
+          const newHearts = Math.max(0, s.hearts - 1);
+          return {
+            hearts:          newHearts,
+            lastHeartLossAt: newHearts < 5 ? (s.lastHeartLossAt ?? Date.now()) : null,
+          };
+        });
       },
 
       setHearts(n) {
-        set({ hearts: n });
+        set((s) => ({
+          hearts:          n,
+          lastHeartLossAt: n < 5 ? (s.lastHeartLossAt ?? Date.now()) : null,
+        }));
       },
 
       setStreak(n) {
@@ -227,17 +318,20 @@ export const useGameStore = create<GameState & GameActions>()(
     {
       name:    "codequest-game-store",
       storage: createJSONStorage(() => localStorage),
-      // Only persist lightweight HUD data; server re-hydrates on mount
       partialize: (s) => ({
-        totalXp:     s.totalXp,
-        level:       s.level,
-        xpToNext:    s.xpToNext,
-        xp:          s.xp,
-        hearts:      s.hearts,
-        streakCount: s.streakCount,
-        cleared:     s.cleared,
-        userId:      s.userId,
-        userName:    s.userName,
+        totalXp:         s.totalXp,
+        level:           s.level,
+        xpToNext:        s.xpToNext,
+        xp:              s.xp,
+        hearts:          s.hearts,
+        streakCount:     s.streakCount,
+        cleared:         s.cleared,
+        userId:          s.userId,
+        userName:        s.userName,
+        badges:          s.badges,
+        skillNodes:      s.skillNodes,
+        lastHeartLossAt: s.lastHeartLossAt,
+        lastActiveDate:  s.lastActiveDate,
       }),
     }
   )
